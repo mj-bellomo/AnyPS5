@@ -6,6 +6,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -35,6 +36,7 @@ int APS5_VABI sceKernelOpen(const char*, int, unsigned short);
 int APS5_VABI sceKernelClose(int);
 int APS5_VABI sceKernelStat(const char*, FileStat*);
 int APS5_VABI sceKernelUnlink(const char*);
+int APS5_VABI sceKernelFcntl(int, int, ...);
 int APS5_VABI sceKernelRmdir(const char*);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI pipe_nid_postfix(int*);
@@ -49,6 +51,14 @@ static void Check(bool value, int line) {
     }
 }
 #define Require(value) Check((value), __LINE__)
+static bool ThrowsOnUnsupportedCommand(int descriptor) {
+    try {
+        sceKernelFcntl(descriptor, 5);
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
 int main() {
     Require(sceKernelDebugOutText(-1, "text") == static_cast<int>(0x80020016u));
     std::uint64_t throttling[4] = {1, 2, 3, 4};
@@ -159,7 +169,13 @@ int main() {
     Require(sceKernelFchmod(socket, 0600) == static_cast<int>(0x80020016u));
     Require(fchmod_nid_postfix(socket, 0600) == -1 && *__error_nid_postfix() == 22);
     Require(futimes_nid_postfix(socket, nullptr) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelFcntl(socket, 3) == 2);
+    Require(sceKernelFcntl(socket, 4, 4) == 0 && sceKernelFcntl(socket, 3) == 6);
+    Require(sceKernelFcntl(socket, 4, 0) == 0 && sceKernelFcntl(socket, 3) == 2);
+    Require(sceKernelFcntl(socket, 4, 0x8000) == static_cast<int>(0x8002002du));
+    Require(sceKernelFcntl(socket, 1) == static_cast<int>(0x80020016u));
     Require(close_nid_postfix(socket) == 0);
+    Require(sceKernelFcntl(socket, 3) == static_cast<int>(0x80020009u));
     Require(fchmod_nid_postfix(socket, 0600) == -1 && *__error_nid_postfix() == 9);
     Require(futimes_nid_postfix(socket, nullptr) == -1 && *__error_nid_postfix() == 9);
     Require(remove_nid_postfix(sized.string().c_str()) == 0);
@@ -199,7 +215,28 @@ int main() {
     Require(unlink_nid_postfix("") == -1 && *__error_nid_postfix() == 2);
     Require(unlink_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == 14);
     const int closable = sceKernelOpen(presentName.c_str(), 0, 0);
-    Require(closable >= 0 && sceKernelClose(closable) == 0);
+    Require(closable >= 0);
+    Require(sceKernelFcntl(closable, 1) == 0);
+    Require(sceKernelFcntl(closable, 2, 1) == 0 && sceKernelFcntl(closable, 1) == 1);
+    Require(sceKernelFcntl(closable, 2, 0) == 0 && sceKernelFcntl(closable, 1) == 0);
+    const int duplicate = sceKernelFcntl(closable, 0, closable + 5);
+    Require(duplicate >= closable + 5 && sceKernelFcntl(duplicate, 1) == 0);
+    Require(sceKernelClose(duplicate) == 0);
+    const int closeOnExecDuplicate = sceKernelFcntl(closable, 17, 0);
+    Require(closeOnExecDuplicate >= 0 && closeOnExecDuplicate != closable && sceKernelFcntl(closeOnExecDuplicate, 1) == 1);
+    Require(sceKernelClose(closeOnExecDuplicate) == 0);
+    Require(sceKernelFcntl(closable, 0, -1) == static_cast<int>(0x80020016u));
+    Require(ThrowsOnUnsupportedCommand(closable));
+#ifndef _WIN32
+    Require(sceKernelFcntl(closable, 3) == 0);
+    Require(sceKernelFcntl(closable, 4, 0x8 | 0x4) == 0 && sceKernelFcntl(closable, 3) == 0xc);
+    Require(sceKernelFcntl(closable, 4, 0) == 0 && sceKernelFcntl(closable, 3) == 0);
+    const int appending = sceKernelOpen(presentName.c_str(), 0x2 | 0x8, 0);
+    Require(appending >= 0 && sceKernelFcntl(appending, 3) == 0xa && sceKernelClose(appending) == 0);
+#endif
+    Require(sceKernelClose(closable) == 0);
+    Require(sceKernelFcntl(closable, 1) == static_cast<int>(0x80020009u));
+    Require(sceKernelFcntl(-1, 3) == static_cast<int>(0x80020009u));
     Require(sceKernelClose(closable) == static_cast<int>(0x80020009u));
     Require(sceKernelClose(-1) == static_cast<int>(0x80020009u));
     Require(unlink_nid_postfix(presentName.c_str()) == 0 && !std::filesystem::exists(present));
