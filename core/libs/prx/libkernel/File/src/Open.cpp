@@ -5,14 +5,21 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "SceTypes.hpp"
 
 #include <cerrno>
+#include <cstdarg>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+extern "C" int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...);
+extern "C" int* APS5_VABI __error_nid_postfix();
 
 #ifdef _WIN32
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
@@ -44,6 +51,56 @@ static int NativeClose(int fd) {
 }
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::_wunlink(p.wstring().c_str());
+}
+static int NativeGetDescriptorFlags(int fd) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+    DWORD flags = 0;
+    if (handle == INVALID_HANDLE_VALUE || !GetHandleInformation(handle, &flags)) {
+        errno = EBADF;
+        return -1;
+    }
+    return (flags & HANDLE_FLAG_INHERIT) != 0 ? 0 : 1;
+}
+static int NativeSetDescriptorFlags(int fd, int flags) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+    if (handle == INVALID_HANDLE_VALUE
+        || !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, (flags & 1) != 0 ? 0 : HANDLE_FLAG_INHERIT)) {
+        errno = EBADF;
+        return -1;
+    }
+    return 0;
+}
+static int NativeDuplicate(int fd, int minimum, bool closeOnExec) {
+    if (minimum < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (File::DirectoryDescriptorPath(fd)) {
+        throw std::runtime_error(std::string("sceKernelFcntl: duplicating a directory descriptor is not supported on this host, fd=") + std::to_string(fd));
+    }
+    std::vector<int> below;
+    int duplicate = ::_dup(fd);
+    while (duplicate >= 0 && duplicate < minimum) {
+        below.push_back(duplicate);
+        duplicate = ::_dup(fd);
+    }
+    const int error = errno;
+    for (const int d : below) ::_close(d);
+    if (duplicate < 0) {
+        errno = error;
+        return -1;
+    }
+    if (NativeSetDescriptorFlags(duplicate, closeOnExec ? 1 : 0) != 0) {
+        ::_close(duplicate);
+        return -1;
+    }
+    return duplicate;
+}
+static int NativeGetStatusFlags(int fd) {
+    throw std::runtime_error(std::string("sceKernelFcntl: F_GETFL is not supported on this host, fd=") + std::to_string(fd));
+}
+static int NativeSetStatusFlags(int fd, int sceFlags) {
+    throw std::runtime_error(std::string("sceKernelFcntl: F_SETFL is not supported on this host, fd=") + std::to_string(fd) + ", flags=" + std::to_string(sceFlags));
 }
 static int MapFlags(int sceFlags) {
     int f = 0;
@@ -77,6 +134,40 @@ static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
 static int NativeClose(int fd) { return ::close(fd); }
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::unlink(p.c_str());
+}
+static int NativeGetDescriptorFlags(int fd) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    return flags < 0 ? -1 : (flags & FD_CLOEXEC) != 0 ? 1 : 0;
+}
+static int NativeSetDescriptorFlags(int fd, int flags) {
+    return ::fcntl(fd, F_SETFD, (flags & 1) != 0 ? FD_CLOEXEC : 0);
+}
+static int NativeDuplicate(int fd, int minimum, bool closeOnExec) {
+    return ::fcntl(fd, closeOnExec ? F_DUPFD_CLOEXEC : F_DUPFD, minimum);
+}
+static int NativeGetStatusFlags(int fd) {
+    const int native = ::fcntl(fd, F_GETFL);
+    if (native < 0) return -1;
+    int f = native & O_ACCMODE;
+    if (native & O_APPEND) f |= SCE_KERNEL_O_APPEND;
+    if (native & O_NONBLOCK) f |= SCE_KERNEL_O_NONBLOCK;
+    if ((native & O_SYNC) == O_SYNC) f |= SCE_KERNEL_O_SYNC;
+    else if (native & O_DSYNC) f |= SCE_KERNEL_O_DSYNC;
+#ifdef O_DIRECT
+    if (native & O_DIRECT) f |= SCE_KERNEL_O_DIRECT;
+#endif
+    return f;
+}
+static int NativeSetStatusFlags(int fd, int sceFlags) {
+    int f = 0;
+    if (sceFlags & SCE_KERNEL_O_APPEND) f |= O_APPEND;
+    if (sceFlags & SCE_KERNEL_O_NONBLOCK) f |= O_NONBLOCK;
+    if (sceFlags & SCE_KERNEL_O_SYNC) f |= O_SYNC;
+    if (sceFlags & SCE_KERNEL_O_DSYNC) f |= O_DSYNC;
+#ifdef O_DIRECT
+    if (sceFlags & SCE_KERNEL_O_DIRECT) f |= O_DIRECT;
+#endif
+    return ::fcntl(fd, F_SETFL, f);
 }
 static int MapFlags(int sceFlags) {
     int f = 0;
@@ -192,9 +283,45 @@ int APS5_VABI sceKernelUnlink(const char* path) {
     return 0;
 }
 
-int APS5_VABI sceKernelFcntl() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelFcntl(int d, int cmd, ...) {
+    constexpr int FcntlDupfd = 0;
+    constexpr int FcntlGetfd = 1;
+    constexpr int FcntlSetfd = 2;
+    constexpr int FcntlGetfl = 3;
+    constexpr int FcntlSetfl = 4;
+    constexpr int FcntlDupfdCloexec = 17;
+    const bool takesArgument = cmd == FcntlDupfd || cmd == FcntlSetfd || cmd == FcntlSetfl || cmd == FcntlDupfdCloexec;
+    int argument = 0;
+    if (takesArgument) {
+#ifdef _WIN32
+        __builtin_sysv_va_list arguments;
+        __builtin_sysv_va_start(arguments, cmd);
+        argument = __builtin_va_arg(arguments, int);
+        __builtin_sysv_va_end(arguments);
+#else
+        std::va_list arguments;
+        va_start(arguments, cmd);
+        argument = va_arg(arguments, int);
+        va_end(arguments);
+#endif
+    }
+    if (d >= GuestSockets::FirstDescriptor) {
+        if (!GuestSockets::IsOpen(d)) return SCE_KERNEL_ERROR_EBADF;
+        const int result = takesArgument ? fcntl_nid_postfix(d, cmd, argument) : fcntl_nid_postfix(d, cmd);
+        return result < 0 ? SceKernelError(*__error_nid_postfix()) : result;
+    }
+    int result = 0;
+    switch (cmd) {
+        case FcntlDupfd: result = NativeDuplicate(d, argument, false); break;
+        case FcntlDupfdCloexec: result = NativeDuplicate(d, argument, true); break;
+        case FcntlGetfd: result = NativeGetDescriptorFlags(d); break;
+        case FcntlSetfd: result = NativeSetDescriptorFlags(d, argument); break;
+        case FcntlGetfl: result = NativeGetStatusFlags(d); break;
+        case FcntlSetfl: result = NativeSetStatusFlags(d, argument); break;
+        default:
+            throw std::runtime_error(std::string(__func__) + ": unsupported command " + std::to_string(cmd) + ", fd=" + std::to_string(d));
+    }
+    return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
 }
